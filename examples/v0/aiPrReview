@@ -1,0 +1,615 @@
+pipeline:
+  name: autoPrReview
+  identifier: autoPrReview
+  projectIdentifier: Data_Platform
+  orgIdentifier: PROD
+  tags:
+    Owner: CODE
+    TicketID: CDS-109885
+  stages:
+    - stage:
+        name: aiPrReview
+        identifier: aiPrReview
+        description: Pipeline for autofixing issues using coding agent
+        type: CI
+        spec:
+          cloneCodebase: true
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: DownloadAgents
+                  identifier: DownloadAgents
+                  spec:
+                    shell: Bash
+                    envVariables:
+                      GCP_KEY: <+stage.variables.GCP_KEY>
+                    command: |
+                      # Show current directory and list contents
+                      echo "Current working directory: $(pwd)"
+                      echo "Listing current directory contents:"
+                      ls -la
+                      echo "Listing parent directory contents:"
+                      ls -la ../
+                      echo "-----------------------------------"
+
+                      # Create directories for downloaded artifacts in parent directory
+                      mkdir -p ../agents
+                      mkdir -p ../binary
+
+                      # Verify gcloud is available and check version
+                      which gcloud
+                      gcloud --version | head -n 1
+
+                      # Create service account key file from the secret in parent directory
+                      echo "Setting up GCP authentication..."
+                      # Write the key to a file without exposing it in logs
+                      set +x  # Disable command echo if it's on
+                      echo "$GCP_KEY" > ../gcp-key.json
+                      set -x  # Re-enable command echo if it was on
+
+                      # Set proper permissions on the key file
+                      chmod 600 ../gcp-key.json
+
+                      # Debug the key file (don't show contents)
+                      echo "Checking key file:"
+                      ls -la ../gcp-key.json
+                      echo "Key file size: $(wc -c < ../gcp-key.json) bytes"
+
+                      # Set the credentials environment variable
+                      export GOOGLE_APPLICATION_CREDENTIALS="$PWD/../gcp-key.json"
+                      echo "Set GOOGLE_APPLICATION_CREDENTIALS to: $GOOGLE_APPLICATION_CREDENTIALS"
+
+                      # Activate the service account
+                      echo "Activating service account..."
+                      gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"
+
+                      # Release type for both agents
+                      RELEASE_TYPE="beta"
+                      echo "Downloading $RELEASE_TYPE release artifacts"
+
+                      # Get latest coding agent artifact
+                      echo "Finding latest coding agent artifact..."
+                      # List all files in the coding agent directory
+                      echo "Listing all files in coding-agent/$RELEASE_TYPE/:"
+                      gcloud storage ls gs://aida-remediation-agent-artifacts/coding-agent/$RELEASE_TYPE/
+
+                      # Find the latest coding agent (looking for pattern like coding-agent-beta-2025-07-08-13-12-03)
+                      LATEST_CODING_AGENT=$(gcloud storage ls gs://aida-remediation-agent-artifacts/coding-agent/$RELEASE_TYPE/ | grep -E "coding-agent-$RELEASE_TYPE-[0-9]{4}-[0-9]{2}-[0-9]{2}" | sort -r | head -n 1 | xargs)
+                      if [ -z "$LATEST_CODING_AGENT" ]; then
+                        echo "ERROR: No coding agent artifact found with expected naming pattern"
+                        # Fallback to any file with coding-agent prefix
+                        LATEST_CODING_AGENT=$(gcloud storage ls gs://aida-remediation-agent-artifacts/coding-agent/$RELEASE_TYPE/ | grep -E 'coding-agent' | sort -r | head -n 1 | xargs)
+                        if [ -z "$LATEST_CODING_AGENT" ]; then
+                          echo "ERROR: No coding agent artifact found at all"
+                          exit 1
+                        fi
+                      fi
+                      echo "Latest coding agent: $LATEST_CODING_AGENT"
+
+                      # Get latest remediation agent artifact
+                      echo "Finding latest remediation agent artifact..."
+                      # List all files in the remediation agent directory
+                      echo "Listing all files in remediation-agent/$RELEASE_TYPE/:"
+                      gcloud storage ls gs://aida-remediation-agent-artifacts/remediation-agent/$RELEASE_TYPE/
+
+                      # Find the latest remediation agent (looking for pattern like remediation-agent-beta-2025-07-08-13-12-03)
+                      LATEST_REMEDIATION_AGENT=$(gcloud storage ls gs://aida-remediation-agent-artifacts/remediation-agent/$RELEASE_TYPE/ | grep -E "remediation-agent-$RELEASE_TYPE-[0-9]{4}-[0-9]{2}-[0-9]{2}" | sort -r | head -n 1 | xargs)
+                      if [ -z "$LATEST_REMEDIATION_AGENT" ]; then
+                        echo "ERROR: No remediation agent artifact found with expected naming pattern"
+                        # Fallback to any file with remediation-agent prefix
+                        LATEST_REMEDIATION_AGENT=$(gcloud storage ls gs://aida-remediation-agent-artifacts/remediation-agent/$RELEASE_TYPE/ | grep -E 'remediation-agent' | sort -r | head -n 1 | xargs)
+                        if [ -z "$LATEST_REMEDIATION_AGENT" ]; then
+                          echo "ERROR: No remediation agent artifact found at all"
+                          exit 1
+                        fi
+                      fi
+                      echo "Latest remediation agent: $LATEST_REMEDIATION_AGENT"
+
+                      # Download only the latest artifacts
+                      echo "Downloading latest coding agent..."
+                      gcloud storage cp "$LATEST_CODING_AGENT" ../agents/ || echo "Failed to download coding agent"
+
+                      echo "Downloading latest remediation agent..."
+                      gcloud storage cp "$LATEST_REMEDIATION_AGENT" ../agents/ || echo "Failed to download remediation agent"
+
+                      # List downloaded artifacts
+                      echo "Downloaded agent artifacts:"
+                      ls -la ../agents/
+
+                      # Get the filenames without paths
+                      CODING_AGENT_FILENAME=$(basename "$LATEST_CODING_AGENT")
+                      REMEDIATION_AGENT_FILENAME=$(basename "$LATEST_REMEDIATION_AGENT")
+
+                      # Copy to binary directory with standard names
+                      cp "../agents/$CODING_AGENT_FILENAME" ../binary/codex-agent
+                      cp "../agents/$REMEDIATION_AGENT_FILENAME" ../binary/remediation-agent
+
+                      # Make binaries executable
+                      chmod +x ../binary/codex-agent
+                      chmod +x ../binary/remediation-agent
+
+                      echo "Agent binaries prepared:"
+                      ls -la ../binary/
+              - step:
+                  type: Run
+                  name: generateReviewPrompt
+                  identifier: generateReviewPrompt
+                  spec:
+                    shell: Sh
+                    command: |-
+                      set -ex
+                      pwd
+                      SOURCE_BRANCH=<+pipeline.variables.sourceBranch>
+                      TARGET_BRANCH=<+pipeline.variables.targetBranch>
+                      REPO_NAME=<+pipeline.properties.ci.codebase.repoName>
+                      echo $REPO_NAME
+                      mkdir -p ../output
+                      cat <<'EOF' >  ../output/task.txt
+                      assume the "<+pipeline.properties.ci.codebase.repoName>"  working directory is a valid git repository.
+
+                      You are an expert software engineer specialized in code reviews.
+                      Your task is to analyze pull request diffs and add pr reviews. you can get the changes by running this command
+                      ```
+                      git diff --color=never <+pipeline.variables.mergeBaseSha>...<+pipeline.variables.sourceSha> | awk '/^@@/{gsub(/.*-/,"",$0);gsub(/,.*\+/," ",$0);gsub(/,.*/,"",$0);split($0,n," ");ol=n[1];nl=n[2];print "=== OLD:"ol" NEW:"nl" ===";next}/^-/{print "OLD:"ol" "$0;ol++;next}/^+/{print "NEW:"nl" "$0;nl++;next}/^ /{print "CTX:"ol"/"nl" "$0;ol++;nl++;next}{print}'
+                      ```
+                      if you need the context of the complete files or any other file after diff for your review you can access it in the working directory.
+                      if you don't find sha just give empty review and exit.
+
+                      Your review should include:
+                      - Provide comments only for lines that have been added, edited, or deleted
+                      - Only mention bugs or issues that are directly related to the syntax or functionality of the provided code changes.
+                      - You can also exact code change using suggestion markdown.
+                      - Do not mention that the file needs a thorough review or caution about potential issues.
+                      - Don't provide suggestions for minor code style issues, missing comments/documentation.
+                      - Comment should STRICTLY only have line numbers for changed lines. Ensure `line_number_start` and `line_number_end` are strictly and accurately computed based on the explained diff format with OLD and NEW line numbers. Comment line numbers MUST be within the range of changes shown in the diff, never outside it. You may use a python script to determine the line numbers presented at each line in the format of `NEW:77 CHANGES\nOLD:70 CHANGES`. IF the changes are in NEW lines, use that for the comment line numbers.
+                      - You are encouraged to use Markdown for your response to format your feedback effectively.
+
+                      Follow strictly these guidelines:
+                      - Look for critical bugs like possible Null pointer exceptions, division by zero, or other logical errors.
+                      - Look for performance issues like avoid nested for loops.
+                      - Look for scalability issues like overflow of memory due to reading of large strings.
+                      - Look for code smells
+                      - Do not make more than <+pipeline.variables.commentCount> comments per PR unless they are necessary.
+                      - Characterize each comment as a bug, code smell, performance issue, scalability concern, or create a new category if none of these apply.
+                      - Do not provide positive comments like good refactoring. Stricly review code for mentioned rules.
+                      - STRICTLY desist from making any comments that require upto date information since your cutoff. Do NOT comment on new versions of packages that you might not be aware off. Example Go 1.24.4 does exist after your knowledge cutoff.
+                      - STRICTLY Desist from making comments for missing imports unless you have seen the whole file and see that import is actually missing.
+                      - In a Git repository, if the file .harness/rules/review.md exists, use the relevant and sensible instructions specified in that file as part of the pull request review process.
+
+
+
+                      Code suggestion markdown are HIGHLY encouraged.
+                      Example of code suggestion markdown:
+                      ```suggestion
+                          {{changed_code}}
+                      ```
+                      Make sure the {{changed_code}} is properly styled/linted and has right tabs and spaces as in original code. This is MUST.
+
+                      Important guidelines for line numbers:
+                      1. Pay careful attention to the line numbers in parentheses
+                      2. For added lines, only 'new line' numbers are available - these are the numbers you should reference
+                      3. For removed lines, only 'old line' numbers are available
+                      4. For context lines, both old and new line numbers are provided
+                      5. Your comments should ONLY reference line numbers that appear in the "new line" positions
+                      6. Focus your review ONLY on the added and removed and modified lines (those marked with "Added line")
+
+                      NEVER comment on line numbers outside the explicitly shown changes in the diff.
+
+                      JSON response format:
+                      {{
+                      "reviews": [
+                          {{
+                          "file_path": "path/to/file",
+                          "line_number_start": 123,
+                          "line_number_end": 125,
+                          "type": "issue|performance|scalability|code_smell|new_category",
+                          "review": "Your review for the file."
+                          }}
+                      ]
+                      }}
+
+                      Write the output to the file `../output/review.json` as well formated JSON. Create file if needed. File should be created even in case there are no comments.
+                      EOF
+
+
+
+                      cat ../output/task.txt
+              - step:
+                  type: Run
+                  name: RunCodingAgent
+                  identifier: RunCodingAgent
+                  spec:
+                    shell: Bash
+                    command: |-
+                      # Show current directory and list contents
+                      set -ex
+                      echo "Current working directory: $(pwd)"
+
+                      # Check if codex-agent binary exists
+                      if [ ! -f "../binary/codex-agent" ]; then
+                        echo "ERROR: codex-agent binary not found at ../binary/codex-agent"
+                        exit 1
+                      fi
+
+
+                      echo "Setting up GCP authentication..."
+                      # Write the key to a file without exposing it in logs
+                      set +x  # Disable command echo if it's on
+                      printf "%s" "$VERTEX_KEY" > ../gcp-key.json
+                      set -x  # Re-enable command echo if it was on
+
+                      # Set proper permissions on the key file
+                      chmod 600 ../gcp-key.json
+
+                      # Debug the key file (don't show contents)
+                      echo "Checking key file:"
+                      ls -la ../gcp-key.json
+                      echo "Key file size: $(wc -c < ../gcp-key.json) bytes"
+
+                      # Set the credentials environment variable
+                      export GOOGLE_APPLICATION_CREDENTIALS="$PWD/../gcp-key.json"
+                      echo "Set GOOGLE_APPLICATION_CREDENTIALS to: $GOOGLE_APPLICATION_CREDENTIALS"
+
+                      # Activate the service account
+                      echo "Activating service account..."
+                      gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"
+
+                      # Set required environment variables
+                      # export ANTHROPIC_API_KEY="<+stage.variables.LLM_API_KEY>"
+                      # export USE_VERTEX_AI=false
+
+                      # Check if task file exists from remediation agent
+                      if [ -f "../output/task.txt" ]; then
+                        echo "Using task file generated by remediation agent"
+                        TASK_FILE="../output/task.txt"
+                      else
+                        echo "WARNING: No task file found from remediation agent, using fallback"
+                        echo "# Fallback Task\n\nInvestigate and fix issues in the codebase." > ../output/task.txt
+                        TASK_FILE="../output/task.txt"
+                      fi
+
+                      # Print debug info
+                      echo "Running codex-agent with:"
+                      echo "Working directory: $(pwd)"
+                      echo "Max iterations: <+stage.variables.MAX_ITERATIONS>"
+                      echo "Task file: $TASK_FILE"
+                      echo "Task file preview (first 100 chars):"
+                      head -c 100 "$TASK_FILE"
+                      echo "..."
+
+                      pwd 
+
+                      # Run the codex-agent with the task file
+                      ../binary/codex-agent \
+                        --api vertex \
+                        --task-file "$TASK_FILE" \
+                        --working-directory $(pwd) \
+                        -c \
+                        --max-iterations <+stage.variables.MAX_ITERATIONS> \
+                        --max-retries <+stage.variables.MAX_RETRIES> 2>&1 |tee /output/coding-agent-comment.txt
+
+                      echo "codex-agent execution completed"
+
+                      pwd
+                      # Show git diff (add untracked files first)
+                      # echo "Changes made by coding agent:"
+                      # git add -A
+                      # git --no-pager diff --cached
+
+                      # cat ../output/review.json
+                    envVariables:
+                      VERTEX_KEY: <+stage.variables.genAIQASA>
+                      GOOGLE_CLOUD_PROJECT: gen-ai-qa
+                      GOOGLE_CLOUD_LOCATION: asia-southeast1
+                      VERTEX_MODEL_NAME: <+stage.variables.VERTEX_MODEL_NAME>
+              - parallel:
+                  - step:
+                      type: Run
+                      name: post comments
+                      identifier: post_comments
+                      spec:
+                        shell: Sh
+                        command: |-
+                          set -ex
+                          JSON_FILE="/output/review.json"
+                          # Initialize comment counter
+                          comment_posted=false
+                          SOURCE_SHA=<+pipeline.variables.sourceSha>
+                          MERGE_BASE_SHA=<+pipeline.variables.mergeBaseSha>
+
+                          REPO_NAME="<+pipeline.properties.ci.codebase.repoName>"
+                          PR_NUMBER="<+pipeline.variables.prNumber>"
+                          API_KEY="<+pipeline.variables.aiReviewSvcAccount>"
+                          URL="https://harness0.harness.io/gateway/code/api/v1/repos/${REPO_NAME}/pullreq/${PR_NUMBER}/comments?accountIdentifier=l7B_kbSEQD2wjrM7PShm5w&orgIdentifier=PROD&projectIdentifier=Data_Platform"
+
+                          if [ -f "$JSON_FILE" ]; then
+                            echo "File exists: $JSON_FILE"
+                            cat $JSON_FILE
+
+                            
+
+                            # Helper function
+                            extract_field() {
+                              local field="$1"
+                              local index="$2"
+                              jq -r ".reviews[$index].$field // empty" "$JSON_FILE"
+                            }
+
+
+                            
+
+                            # Get number of reviews
+                            REVIEW_COUNT=$(jq -r '.reviews | length' "$JSON_FILE")
+
+                            if [ "$REVIEW_COUNT" -eq 0 ]; then
+                              comment_posted=false
+                            else
+                              for i in $(seq 0 $((REVIEW_COUNT - 1))); do
+                                FILE_PATH=$(extract_field "file_path" "$i")
+                                LINE_START=$(jq -r ".reviews[$i].line_number_start // empty" "$JSON_FILE")
+                                LINE_END=$(jq -r ".reviews[$i].line_number_end // .reviews[$i].line_number_start // empty" "$JSON_FILE")
+                                COMMENT_TYPE=$(extract_field "type" "$i")
+                                REVIEW_TEXT=$(extract_field "review" "$i")
+
+                                # Skip empty reviews
+                                if [ -z "$REVIEW_TEXT" ]; then
+                                  continue
+                                fi
+
+                                FORMATTED_TEXT="${COMMENT_TYPE}:: ${REVIEW_TEXT}"
+
+                                payload=$(jq -n \
+                                  --arg text "$FORMATTED_TEXT" \
+                                  --arg path "$FILE_PATH" \
+                                  --arg source_commit_sha "$SOURCE_SHA" \
+                                  --arg target_commit_sha "$MERGE_BASE_SHA" \
+                                  --argjson line_start "${LINE_START:-0}" \
+                                  --argjson line_end "${LINE_END:-0}" \
+                                  --argjson line_start_new true \
+                                  --argjson line_end_new true \
+                                  '{
+                                    text: $text,
+                                    line_start: $line_start,
+                                    line_end: $line_end,
+                                    line_start_new: $line_start_new,
+                                    line_end_new: $line_end_new,
+                                    path: $path,
+                                    source_commit_sha: $source_commit_sha,
+                                    target_commit_sha: $target_commit_sha,
+                                    parent_id: 0
+                                  }')
+
+                                echo "Payload being sent:"
+                                echo "$payload"
+                                echo "---"
+
+
+                                echo "Running curl command:"
+
+                                curl -i -X POST "$URL" \
+                                  -H "Content-Type: application/json" \
+                                  -H "x-api-key: $API_KEY" \
+                                  -d "$payload"
+
+                                comment_posted=true
+                              done
+                            fi
+
+                          else
+                              echo "File does not exist: $JSON_FILE"
+                              exit 1
+                          fi
+
+                          if [ "$comment_posted" = false ]; then
+                            echo "No comments found. Posting default message."
+
+
+                            FALLBACK_PAYLOAD='{"text":"No comments. Nice PR!"}'
+
+                            curl -i -f -X POST "$URL" \
+                              -H "Content-Type: application/json" \
+                              -H "x-api-key: $API_KEY" \
+                              -d "$FALLBACK_PAYLOAD"
+                          fi
+                      when:
+                        stageStatus: Success
+                        condition: <+codebase.repoUrl>.contains("github") == false
+                  - step:
+                      type: Run
+                      name: post comments github
+                      identifier: post_comments_github
+                      spec:
+                        shell: Sh
+                        command: |-
+                          set -ex
+                          JSON_FILE="/output/review.json"
+                          comment_posted=false
+
+                          REPO="OWNER/REPO" # e.g. octocat/Hello-World
+                          PR_NUMBER="<+pipeline.variables.prNumber>"
+                          API_KEY="<+pipeline.variables.githubToken>" # GitHub token
+                          SOURCE_SHA="<+pipeline.variables.sourceSha>" # head commit SHA
+                          MERGE_BASE_SHA="<+pipeline.variables.mergeBaseSha>" # base commit SHA
+
+                          URL="https://api.github.com/repos/${REPO}/pulls/${PR_NUMBER}/comments"
+
+                          if [ -f "$JSON_FILE" ]; then
+                            echo "File exists: $JSON_FILE"
+                            cat $JSON_FILE
+
+                            extract_field() {
+                              local field="$1"
+                              local index="$2"
+                              jq -r ".reviews[$index].$field // empty" "$JSON_FILE"
+                            }
+
+                            REVIEW_COUNT=$(jq -r '.reviews | length' "$JSON_FILE")
+
+                            if [ "$REVIEW_COUNT" -eq 0 ]; then
+                              comment_posted=false
+                            else
+                              for i in $(seq 0 $((REVIEW_COUNT - 1))); do
+                                FILE_PATH=$(extract_field "file_path" "$i")
+                                LINE_START=$(jq -r ".reviews[$i].line_number_start // empty" "$JSON_FILE")
+                                LINE_END=$(jq -r ".reviews[$i].line_number_end // .reviews[$i].line_number_start // empty" "$JSON_FILE")
+                                COMMENT_TYPE=$(extract_field "type" "$i")
+                                REVIEW_TEXT=$(extract_field "review" "$i")
+
+                                if [ -z "$REVIEW_TEXT" ]; then
+                                  continue
+                                fi
+
+                                FORMATTED_TEXT="${COMMENT_TYPE}:: ${REVIEW_TEXT}"
+
+                                payload=$(jq -n \
+                                  --arg body "$FORMATTED_TEXT" \
+                                  --arg commit_id "$SOURCE_SHA" \
+                                  --arg path "$FILE_PATH" \
+                                  --argjson start_line "${LINE_START:-0}" \
+                                  --argjson line "${LINE_END:-0}" \
+                                  --arg start_side "RIGHT" \
+                                  --arg side "RIGHT" \
+                                  '{
+                                    body: $body,
+                                    commit_id: $commit_id,
+                                    path: $path,
+                                    start_line: $start_line,
+                                    line: $line,
+                                    start_side: $start_side,
+                                    side: $side
+                                  }')
+
+                                echo "Payload being sent:"
+                                echo "$payload"
+                                echo "---"
+
+                                curl -i -X POST "$URL" \
+                                  -H "Accept: application/vnd.github+json" \
+                                  -H "Authorization: Bearer $API_KEY" \
+                                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                                  -d "$payload"
+
+                                comment_posted=true
+                              done
+                            fi
+                          else
+                            echo "File does not exist: $JSON_FILE"
+                            exit 1
+                          fi
+
+                          if [ "$comment_posted" = false ]; then
+                            echo "No comments found. Posting default message."
+
+                            FALLBACK_PAYLOAD=$(jq -n \
+                              --arg body "No comments. Nice PR!" \
+                              --arg commit_id "$SOURCE_SHA" \
+                              --arg path "README.md" \
+                              --argjson line 1 \
+                              --arg side "RIGHT" \
+                              '{body: $body, commit_id: $commit_id, path: $path, line: $line, side: $side}')
+
+                            curl -i -X POST "$URL" \
+                              -H "Accept: application/vnd.github+json" \
+                              -H "Authorization: Bearer $API_KEY" \
+                              -H "X-GitHub-Api-Version: 2022-11-28" \
+                              -d "$FALLBACK_PAYLOAD"
+                          fi
+                      when:
+                        stageStatus: Success
+                        condition: <+codebase.repoUrl>.contains("github") == true
+          buildIntelligence:
+            enabled: false
+          caching:
+            enabled: false
+            paths: []
+        variables:
+          - name: GCP_KEY
+            type: Secret
+            description: GCP service account key for accessing GCS
+            required: true
+            value: org.gcpfileplatform
+          - name: LLM_API_KEY
+            type: Secret
+            description: API key for LLM service
+            required: true
+            value: autofixPipelineAnthropicApiKey
+          - name: HARNESS_TOKEN
+            type: Secret
+            description: PAT for talking to Harness
+            value: logDownloadAutoFix
+          - name: LLM_MODEL
+            type: String
+            description: LLM model to use for remediation agent
+            required: true
+            value: claude-sonnet-4-20250514
+          - name: MAX_ITERATIONS
+            type: String
+            description: Maximum iterations for the coding agent
+            required: true
+            value: "50"
+          - name: MAX_RETRIES
+            type: String
+            description: Maximum retries for the coding agent
+            required: true
+            value: "1"
+          - name: genAIQASA
+            type: Secret
+            description: ""
+            required: true
+            value: org.seceng-1659-key
+          - name: VERTEX_MODEL_NAME
+            type: String
+            description: ""
+            required: true
+            value: claude-sonnet-4@20250514
+  properties:
+    ci:
+      codebase:
+        connectorRef: <+input>
+        repoName: <+input>
+        build: <+input>
+        sparseCheckout: []
+        depth: 1000
+  variables:
+    - name: sourceBranch
+      type: String
+      description: ""
+      required: true
+      value: <+input>
+    - name: targetBranch
+      type: String
+      description: ""
+      required: true
+      value: <+input>
+    - name: commentCount
+      type: Number
+      description: ""
+      required: true
+      value: <+input>
+    - name: mergeBaseSha
+      type: String
+      description: ""
+      required: true
+      value: <+input>
+    - name: sourceSha
+      type: String
+      description: ""
+      required: true
+      value: <+input>
+    - name: aiReviewSvcAccount
+      type: Secret
+      description: ""
+      required: true
+      value: harnessAiCodeReview
+    - name: prNumber
+      type: String
+      description: ""
+      required: true
+      value: <+input>
