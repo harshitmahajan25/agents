@@ -1,0 +1,119 @@
+pipeline:
+  name: autoPrReview
+  identifier: autoPrReview
+  projectIdentifier: SEI
+  orgIdentifier: default
+  description: Code review pipeline with AI agents
+  tags:
+    Owner: CODE
+  stages:
+    - stage:
+        name: review
+        identifier: review
+        description: Code review stage with AI agents
+        type: CI
+        spec:
+          cloneCodebase: true
+          platform:
+            os: Linux
+            arch: Arm64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Plugin
+                  name: review_prompt_generation_agent
+                  identifier: review_prompt_generation_agent
+                  spec:
+                    image: abhinavharness/drone-ai-review:latest
+                    settings:
+                      output_file: /harness/5c5b7e75_813d_40ec_9836_40b5bcf750e6_autofix/task.txt
+                      review_output_file: /harness/5c5b7e75_813d_40ec_9836_40b5bcf750e6_autofix/review.json
+                      working_directory: /harness
+              - step:
+                  type: Plugin
+                  name: coding_agent
+                  identifier: coding_agent
+                  spec:
+                    image: anewdocker25/mydockerhub:coding-agent
+                    settings:
+                      detailed_logging: "true"
+                      max_iterations: "50"
+                      task_file_path: /harness/5c5b7e75_813d_40ec_9836_40b5bcf750e6_autofix/task.txt
+                      working_directory: /harness
+                      show_diff: "false"
+                      anthropic_api_key: <+pipeline.variables.anthropicKey>
+              - step:
+                  type: Plugin
+                  name: post_comments
+                  identifier: post_comments
+                  spec:
+                    image: abhinavharness/comment-plugin:latest
+                    settings:
+                      comments_file: /harness/5c5b7e75_813d_40ec_9836_40b5bcf750e6_autofix/review.json
+                      repo: <+pipeline.variables.repo>
+                      pr_number: <+pipeline.variables.pullReq>
+                      token: <+pipeline.variables.harnessKey>
+          caching:
+            enabled: false
+            paths: []
+          buildIntelligence:
+            enabled: false
+  properties:
+    ci:
+      codebase:
+        repoName: <+pipeline.variables.repo>
+        build:
+          type: PR
+          spec:
+            number: <+pipeline.variables.pullReq>
+        depth: 1000
+        sparseCheckout: []
+  variables:
+    - name: anthropicKey
+      type: Secret
+      description: Anthropic API key for coding agent
+      required: true
+      value: autofixAnthropicApiKey
+    - name: harnessKey
+      type: Secret
+      description: Harness API key for posting comments
+      required: true
+      value: pr-review-token
+    - name: repo
+      type: String
+      description: Repository identifier
+      required: true
+      value: <+input>
+    - name: pullReq
+      type: String
+      description: Pull request number
+      required: true
+      value: <+input>
+    - name: sourceBranch
+      type: String
+      description: ""
+      required: true
+      value: <+input>
+    - name: targetBranch
+      type: String
+      description: ""
+      required: true
+      value: <+input>
+    - name: commentCount
+      type: Number
+      description: ""
+      required: true
+      value: <+input>
+    - name: mergeBaseSha
+      type: String
+      description: ""
+      required: true
+      value: <+input>
+    - name: sourceSha
+      type: String
+      description: ""
+      required: true
+      value: <+input>
