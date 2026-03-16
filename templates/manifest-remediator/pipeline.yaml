@@ -16,7 +16,7 @@ pipeline:
         - name: Manifest Remediator
           run:
             container:
-              image: rajpatel2/manifest-remediator:manifest-remediator
+              image: pkg.harness.io/vrvdt5ius7uwygso8s0bia/harness-agents/manifest-remediator-plugin:main
             with:
               detailed_logging: "true"
               harness_api_key: <+inputs.harnessKey>
