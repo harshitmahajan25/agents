@@ -1,0 +1,20 @@
+version: 1
+agent:
+  stages:
+    - name: run
+      steps:
+        - name: agent step
+          agent:
+            container:
+              image: docker.io/myorg/agent:latest
+            task: Do something
+            mcp_servers:
+              harness:
+                url: https://mcp.harness.io/mcp
+              github:
+                url: https://api.github.com/mcp
+                headers:
+                  Authorization: "Bearer <+inputs.githubToken>"
+                allowed:
+                  - get_pull_request
+                  - list_comments
