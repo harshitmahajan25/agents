@@ -1,5 +1,5 @@
 {
-    "name": "autofix",
+    "name": "converter_test",
     "description": "Autofix is an agent that can be used to auto-identify issues with CI pipelines and raise fixes for them",
     "version": "1.0.0"
 }
